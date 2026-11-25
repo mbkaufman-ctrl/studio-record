@@ -549,19 +549,69 @@ impl Recording {
 }
 
 fn finalize(ffmpeg: &Path, video: &Path, audio: Option<&(PathBuf, f64)>, out: &Path) -> Result<(), String> {
+    let partial = out.with_extension("partial.mp4");
     let mut cmd = Command::new(ffmpeg);
     cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-i"]).arg(video);
     if let Some((wav, offset)) = audio {
-        cmd.args(["-itsoffset", &format!("{offset:.3}"), "-i"]).arg(wav);
-        cmd.args(["-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-shortest"]);
+        cmd.args(["-itsoffset", &format!("{offset:.3}")]);
+        let channels = hound::WavReader::open(wav).map_err(|e| e.to_string())?.spec().channels;
+        if channels == 1 {
+            // Hound's extensible mono WAV names the channel FL, which
+            // FFmpeg's AAC encoder rejects as a single-channel layout.
+            cmd.args(["-channel_layout", "mono"]);
+        }
+        cmd.arg("-i").arg(wav);
+        cmd.args(["-map", "0:v:0", "-map", "1:a:0", "-af", "apad", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-shortest"]);
     } else {
         cmd.args(["-c", "copy"]);
     }
-    cmd.args(["-movflags", "+faststart"]).arg(out);
+    cmd.args(["-movflags", "+faststart"]).arg(&partial);
     let o = hidden(&mut cmd).output().map_err(|e| e.to_string())?;
     if o.status.success() {
-        Ok(())
+        std::fs::rename(&partial, out).map_err(|e| e.to_string())
     } else {
-        Err(String::from_utf8_lossy(&o.stderr).lines().last().unwrap_or("unknown error").to_string())
+        let _ = std::fs::remove_file(&partial);
+        Err(String::from_utf8_lossy(&o.stderr).lines().next().unwrap_or("unknown error").to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires FFmpeg"]
+    fn exports_hound_mono_without_cutting_the_picture_short() {
+        let ffmpeg = find_ffmpeg().expect("FFmpeg is required for this test");
+        let dir = std::env::temp_dir().join(format!("studio-record-export-test-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let video = dir.join("video.mkv");
+        let wav = dir.join("voice.wav");
+        let out = dir.join("recording.mp4");
+        let input = Command::new(&ffmpeg)
+            .args(["-v", "error", "-f", "lavfi", "-i", "color=s=64x64:r=20:d=2", "-c:v", "mpeg4"])
+            .arg(&video)
+            .output()
+            .unwrap();
+        assert!(input.status.success(), "{}", String::from_utf8_lossy(&input.stderr));
+        let mut writer = hound::WavWriter::create(&wav, hound::WavSpec {
+            channels: 1,
+            sample_rate: 24000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        }).unwrap();
+        for i in 0..12_000 {
+            writer.write_sample((i as f32 * 0.1).sin() * 0.25).unwrap();
+        }
+        writer.finalize().unwrap();
+        finalize(&ffmpeg, &video, Some(&(wav, 0.1)), &out).unwrap();
+        let decoded = Command::new(&ffmpeg)
+            .args(["-v", "error", "-i"]).arg(&out)
+            .args(["-map", "0:a:0", "-f", "s16le", "-"])
+            .output().unwrap();
+        assert!(decoded.status.success());
+        assert!(decoded.stdout.len() >= 24_000 * 2 * 18 / 10, "audio padding should cover the full video");
+        assert!(decoded.stdout.chunks_exact(2).any(|s| i16::from_le_bytes([s[0], s[1]]).unsigned_abs() > 1000));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
