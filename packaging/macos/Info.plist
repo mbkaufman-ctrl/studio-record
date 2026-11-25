@@ -15,6 +15,6 @@
   <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
   <key>NSCameraUsageDescription</key><string>Studio Record shows your camera in your lectures, recordings and calls.</string>
   <key>NSMicrophoneUsageDescription</key><string>Studio Record records your voice with your lectures.</string>
-  <key>NSScreenCaptureUsageDescription</key><string>Studio Record captures your screen so you can present it.</string>
+  <key>NSScreenCaptureUsageDescription</key><string>Studio Record captures the screen or window you select, and records its sound when Screen audio is enabled.</string>
 </dict>
 </plist>

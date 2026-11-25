@@ -12,28 +12,33 @@
 
 use super::{CaptureCtx, DeviceInfo, DeviceKind, Permission, SourceState};
 use crate::frame::{FpsMeter, Frame, FrameSlot};
+use crate::recording_audio::{ScreenAudioFeed, ScreenSamples, SCREEN_CHANNELS, SCREEN_RATE};
 use objc2::rc::{autoreleasepool, Retained};
-use objc2::runtime::{Bool, ProtocolObject};
+use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, AllocAnyThread, DefinedClass};
 use objc2_av_foundation::{
-    AVAuthorizationStatus, AVCaptureConnection, AVCaptureDevice, AVCaptureDeviceInput, AVCaptureInput,
+    AVCaptureConnection, AVCaptureDevice, AVCaptureDeviceInput, AVCaptureInput,
     AVCaptureOutput, AVCaptureScreenInput, AVCaptureSession, AVCaptureSessionPreset1280x720,
     AVCaptureSessionPreset1920x1080, AVCaptureVideoDataOutput, AVCaptureVideoDataOutputSampleBufferDelegate,
     AVMediaTypeMuxed, AVMediaTypeVideo,
 };
-use objc2_core_media::{CMSampleBuffer, CMTime};
+use objc2_core_audio_types::{
+    AudioBuffer, AudioBufferList, kAudioFormatFlagIsBigEndian, kAudioFormatFlagIsFloat,
+    kAudioFormatFlagIsNonInterleaved, kAudioFormatLinearPCM,
+};
+use objc2_core_media::{CMAudioFormatDescriptionGetStreamBasicDescription, CMSampleBuffer, CMTime};
 use objc2_core_video::{
     kCVPixelBufferPixelFormatTypeKey, kCVPixelFormatType_32BGRA, CVPixelBufferGetBaseAddress,
     CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight, CVPixelBufferGetWidth, CVPixelBufferIsPlanar,
     CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
 };
-use objc2_foundation::{NSArray, NSDictionary, NSError, NSNumber, NSObject, NSObjectProtocol, NSString};
+use objc2_foundation::{NSArray, NSDictionary, NSError, NSNumber, NSObject, NSObjectProtocol, NSProcessInfo, NSString};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCShareableContent, SCStream, SCStreamConfiguration, SCStreamOutput, SCStreamOutputType,
 };
 use parking_lot::Mutex;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -159,6 +164,11 @@ pub fn screen_recording_allowed() -> bool {
     unsafe { CGPreflightScreenCaptureAccess() }
 }
 
+pub fn screen_audio_supported() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| NSProcessInfo::processInfo().operatingSystemVersion().majorVersion >= 13)
+}
+
 // ---------------------------------------------------------------------------
 // Device list
 
@@ -223,6 +233,7 @@ pub struct DelegateIvars {
     fps: Arc<Mutex<FpsMeter>>,
     last_frame_ms: Arc<AtomicU64>,
     epoch: Instant,
+    audio: Option<(ScreenAudioFeed, Arc<AtomicBool>)>,
 }
 
 define_class!(
@@ -238,6 +249,8 @@ define_class!(
         unsafe fn sc_output(&self, _stream: &SCStream, sample: &CMSampleBuffer, kind: SCStreamOutputType) {
             if kind == SCStreamOutputType::Screen {
                 self.handle(sample);
+            } else if kind == SCStreamOutputType::Audio {
+                self.handle_audio(sample);
             }
         }
     }
@@ -278,6 +291,75 @@ impl SampleDelegate {
             CVPixelBufferUnlockBaseAddress(&pb, CVPixelBufferLockFlags::ReadOnly);
         }
     }
+
+    fn handle_audio(&self, sample: &CMSampleBuffer) {
+        let Some((feed, stopped)) = &self.ivars().audio else { return };
+        if stopped.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(sender) = feed.sender() else { return };
+        let received_at = Instant::now();
+        if let Some(interleaved) = copy_screen_audio(sample) {
+            let _ = sender.try_send(ScreenSamples { received_at, interleaved });
+        }
+    }
+}
+
+fn copy_screen_audio(sample: &CMSampleBuffer) -> Option<Vec<f32>> {
+    #[repr(C)]
+    struct StereoBuffers {
+        count: u32,
+        buffers: [AudioBuffer; 2],
+    }
+
+    // ScreenCaptureKit supplies native-endian float PCM. Verify the ASBD
+    // before giving Core Media writable storage in its reported layout.
+    let description = unsafe { sample.format_description() }?;
+    let format = unsafe { CMAudioFormatDescriptionGetStreamBasicDescription(&description).as_ref() }?;
+    if format.mFormatID != kAudioFormatLinearPCM
+        || format.mFormatFlags & (kAudioFormatFlagIsFloat | kAudioFormatFlagIsBigEndian) != kAudioFormatFlagIsFloat
+        || format.mBitsPerChannel != 32
+        || format.mChannelsPerFrame != SCREEN_CHANNELS.into()
+        || format.mSampleRate != f64::from(SCREEN_RATE)
+    {
+        return None;
+    }
+    let frames = i32::try_from(unsafe { sample.num_samples() }).ok()?;
+    if !(1..=SCREEN_RATE as i32).contains(&frames) {
+        return None;
+    }
+    let planar = format.mFormatFlags & kAudioFormatFlagIsNonInterleaved != 0;
+    let bytes_per_frame = if planar { 4 } else { 8 };
+    if format.mBytesPerFrame != bytes_per_frame {
+        return None;
+    }
+    let mut samples = vec![0.0f32; frames as usize * 2];
+    let first = samples.as_mut_ptr();
+    let second = unsafe { first.add(frames as usize) };
+    let mut buffers = StereoBuffers {
+        count: if planar { 2 } else { 1 },
+        buffers: [
+            AudioBuffer {
+                mNumberChannels: if planar { 1 } else { 2 },
+                mDataByteSize: frames as u32 * bytes_per_frame,
+                mData: first.cast(),
+            },
+            AudioBuffer {
+                mNumberChannels: 1,
+                mDataByteSize: frames as u32 * 4,
+                mData: second.cast(),
+            },
+        ],
+    };
+    let list = std::ptr::NonNull::from(&mut buffers).cast::<AudioBufferList>();
+    if unsafe { sample.copy_pcm_data_into_audio_buffer_list(0, frames, list) } != 0 {
+        return None;
+    }
+    if planar {
+        let (first, second) = samples.split_at(frames as usize);
+        return Some(first.iter().zip(second.iter()).flat_map(|(&left, &right)| [left, right]).collect());
+    }
+    Some(samples)
 }
 
 // ---------------------------------------------------------------------------
@@ -444,18 +526,31 @@ fn run_sck(ctx: &CaptureCtx, target: Target) -> Result<(), String> {
         config.setShowsCursor(true);
         config.setQueueDepth(5);
         config.setIgnoreShadowsSingleWindow(true);
+        let audio = ctx.opts.screen_audio.clone().filter(|_| screen_audio_supported());
+        if audio.is_some() {
+            config.setCapturesAudio(true);
+            config.setExcludesCurrentProcessAudio(true);
+            config.setSampleRate(SCREEN_RATE as isize);
+            config.setChannelCount(SCREEN_CHANNELS as isize);
+        }
         let stream = SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &config, None);
         let delegate = SampleDelegate::create(DelegateIvars {
             slot: ctx.slot.clone(),
             fps: ctx.fps.clone(),
             last_frame_ms: last_frame_ms.clone(),
             epoch,
+            audio: audio.clone().map(|feed| (feed, ctx.stop.clone())),
         });
         let queue = dispatch2::DispatchQueue::new("studio-record.sck", dispatch2::DispatchQueueAttr::SERIAL);
         let proto = ProtocolObject::<dyn SCStreamOutput>::from_ref(&*delegate);
         stream
             .addStreamOutput_type_sampleHandlerQueue_error(proto, SCStreamOutputType::Screen, Some(&queue))
             .map_err(|e| e.localizedDescription().to_string())?;
+        if audio.is_some() {
+            stream
+                .addStreamOutput_type_sampleHandlerQueue_error(proto, SCStreamOutputType::Audio, Some(&queue))
+                .map_err(|e| e.localizedDescription().to_string())?;
+        }
         Ok::<_, String>((stream, delegate, queue, (w_pt, h_pt)))
     })?;
 
@@ -615,6 +710,7 @@ unsafe fn build_session(
         fps: ctx.fps.clone(),
         last_frame_ms,
         epoch,
+        audio: None,
     });
     let queue = dispatch2::DispatchQueue::new("studio-record.capture", dispatch2::DispatchQueueAttr::SERIAL);
     let proto = ProtocolObject::<dyn AVCaptureVideoDataOutputSampleBufferDelegate>::from_ref(&*delegate);

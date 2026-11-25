@@ -18,6 +18,7 @@ mod macapp;
 mod mixer;
 mod permissions;
 mod recorder;
+mod recording_audio;
 mod selftest;
 mod theme;
 mod vcam;

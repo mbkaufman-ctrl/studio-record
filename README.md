@@ -63,7 +63,11 @@ and the command palette use that language list.
    Screen + Face, Face, iPad + Face, Screen, iPad, iPad beside Face.
 3. **Record.** Press `⌘R` (`Ctrl+R` on Windows and Linux) or *Start recording*.
    Files go to `Movies/Studio Record` (or `Videos/Studio Record`) as
-   `Lecture <date> at <time>.mp4`, with your microphone. Recordings in
+   `Lecture <date> at <time>.mp4`. In **Recording audio**, choose your
+   microphone and use its volume and mute controls. On macOS 13 and later,
+   turn on **Screen audio** to record sound from the selected display or
+   the app that owns the selected window. Both inputs have independent
+   volume and mute controls that work while recording. Recordings in
    progress are written as Matroska (`.mkv`), so a crash never loses a
    lecture.
 4. **Calls.** Turn on *Camera for calls* (`Ctrl+Option+C`, or `Ctrl+Alt+C`
@@ -112,7 +116,8 @@ In your call, choose that camera (for example "OBS Virtual Camera").
 Recording uses FFmpeg with the computer's hardware encoder (VideoToolbox,
 NVENC, Quick Sync, AMF or Media Foundation), falling back to x264.
 Studio Record looks for FFmpeg next to the app, in its data folder, on
-`PATH`, and in Homebrew's folder. If it isn't found, *Set up recording*
+`PATH`, and in Homebrew's folder. On export, the recorder combines enabled
+audio inputs into one AAC track in the MP4. If FFmpeg isn't found, *Set up recording*
 downloads a static build with the system's `curl` and `tar`.
 
 ## Building
@@ -142,9 +147,9 @@ Developer flags:
   (DXGI / PipeWire / X11).
 - `mixer.rs`: a fixed-rate compositor with picture-in-picture,
   side-by-side, a 200 ms fade, SIMD scaling and a reused frame pool.
-- `recorder.rs`: an FFmpeg pipe plus a WAV of the microphone, joined into
-  MP4 when you stop. Video is paced by the wall clock, so it can't drift
-  away from the voice.
+- `recorder.rs` and `recording_audio.rs`: an FFmpeg video pipe plus a WAV
+  for each enabled audio input, joined into MP4 when you stop. The audio
+  mix uses each input’s start time on the recording timeline.
 - `vcam/`: CoreMediaIO sink stream on macOS, the OBS shared-memory queue on
   Windows, and v4l2loopback on Linux.
 

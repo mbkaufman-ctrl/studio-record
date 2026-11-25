@@ -48,7 +48,7 @@ pub fn run(secs: u64) -> i32 {
     let cam = devices.iter().find(|d| d.kind == DeviceKind::Camera && !d.is_virtual && d.detail == "Built-in")
         .or_else(|| devices.iter().find(|d| d.kind == DeviceKind::Camera && !d.is_virtual));
     let screen = devices.iter().find(|d| d.kind == DeviceKind::Display);
-    let opts = CaptureOptions { max_width: 1280, max_height: 720, fps: 30 };
+    let opts = CaptureOptions { max_width: 1280, max_height: 720, fps: 30, screen_audio: None };
 
     let settings = MixSettings { size: mixer::OutputSize::P720, ..Default::default() };
     let scenes = vec![
@@ -58,7 +58,7 @@ pub fn run(secs: u64) -> i32 {
     let mixer = Mixer::start(settings, scenes, 0);
     let mut handles = Vec::new();
     if let Some(c) = cam {
-        let h = capture::open(c, opts);
+        let h = capture::open(c, opts.clone());
         mixer.set_source(Role::Camera, Some(h.slot.clone()));
         handles.push(("camera", h));
     }
@@ -87,6 +87,8 @@ pub fn run(secs: u64) -> i32 {
         folder: folder.clone(),
         mic: None,
         record_audio: false,
+        mic_volume: 100,
+        screen_audio: None,
         width: 1280,
         height: 720,
         fps: 30,

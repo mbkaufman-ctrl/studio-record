@@ -4,18 +4,19 @@
 //! computer's hardware encoder when one works (VideoToolbox, NVENC, Quick
 //! Sync, AMF, Media Foundation) and falls back to x264.
 //!
-//! Audio: the microphone is written to a WAV next to the video while
-//! recording; when you stop, both are joined into the final MP4. The work in
+//! Audio inputs are written to WAV files next to the video while recording.
+//! On stop, their mix is joined with the video in the final MP4. The work in
 //! progress is a Matroska file, so even a crash or power cut leaves a
 //! playable recording behind.
 
 use crate::frame::FrameRef;
+use crate::recording_audio::{self, AudioCapture, InputTrack, PauseTime, ScreenAudioRequest, TrackFile};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use parking_lot::Mutex;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -219,111 +220,6 @@ pub fn list_microphones() -> Vec<String> {
     out
 }
 
-struct AudioCapture {
-    stop: Arc<AtomicBool>,
-    thread: Option<std::thread::JoinHandle<Result<Option<(PathBuf, f64)>, String>>>,
-}
-
-/// Starts the microphone on its own thread (cpal streams aren't `Send`).
-/// Returns the WAV path and the delay (seconds) between `t0` and the first
-/// sample when stopped.
-fn start_audio(mic: Option<String>, wav: PathBuf, t0: Instant, level: Arc<AtomicU32>, paused: Arc<AtomicBool>, muted: Arc<AtomicBool>) -> AudioCapture {
-    let stop = Arc::new(AtomicBool::new(false));
-    let s2 = stop.clone();
-    let thread = std::thread::Builder::new()
-        .name("microphone".into())
-        .spawn(move || -> Result<Option<(PathBuf, f64)>, String> {
-            use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-            let host = cpal::default_host();
-            let device = match &mic {
-                Some(name) => host
-                    .input_devices()
-                    .ok()
-                    .and_then(|mut it| it.find(|d| d.description().map(|x| x.name() == name).unwrap_or(false)))
-                    .or_else(|| host.default_input_device()),
-                None => host.default_input_device(),
-            };
-            let Some(device) = device else { return Ok(None) };
-            let cfg = device.default_input_config().map_err(|e| e.to_string())?;
-            let channels = cfg.channels();
-            let rate = cfg.sample_rate();
-            let spec = hound::WavSpec { channels, sample_rate: rate, bits_per_sample: 32, sample_format: hound::SampleFormat::Float };
-            let writer = Arc::new(Mutex::new(Some(hound::WavWriter::create(&wav, spec).map_err(|e| e.to_string())?)));
-            let first = Arc::new(Mutex::new(None::<Instant>));
-
-            let w2 = writer.clone();
-            let f2 = first.clone();
-            let l2 = level.clone();
-            let push = move |samples: &mut dyn Iterator<Item = f32>| {
-                let mut f = f2.lock();
-                if f.is_none() {
-                    *f = Some(Instant::now());
-                }
-                drop(f);
-                let mut peak = 0f32;
-                if paused.load(Ordering::Relaxed) {
-                    return; // paused: this stretch isn't in the recording
-                }
-                let mute = muted.load(Ordering::Relaxed);
-                if let Some(w) = w2.lock().as_mut() {
-                    for s in samples {
-                        let s = if mute { 0.0 } else { s };
-                        peak = peak.max(s.abs());
-                        let _ = w.write_sample(s);
-                    }
-                }
-                let prev = f32::from_bits(l2.load(Ordering::Relaxed));
-                let v = if peak > prev { peak } else { prev * 0.9 + peak * 0.1 };
-                l2.store(v.to_bits(), Ordering::Relaxed);
-            };
-            let err = |e: cpal::Error| log::warn!("microphone: {e}");
-            let config = cfg.config();
-            let stream = match cfg.sample_format() {
-                cpal::SampleFormat::F32 => device.build_input_stream::<f32, _, _>(
-                    config,
-                    move |d: &[f32], _| push(&mut d.iter().copied()),
-                    err,
-                    None,
-                ),
-                cpal::SampleFormat::I16 => device.build_input_stream::<i16, _, _>(
-                    config,
-                    move |d: &[i16], _| push(&mut d.iter().map(|s| *s as f32 / 32768.0)),
-                    err,
-                    None,
-                ),
-                cpal::SampleFormat::I32 => device.build_input_stream::<i32, _, _>(
-                    config,
-                    move |d: &[i32], _| push(&mut d.iter().map(|s| *s as f32 / 2147483648.0)),
-                    err,
-                    None,
-                ),
-                cpal::SampleFormat::U16 => device.build_input_stream::<u16, _, _>(
-                    config,
-                    move |d: &[u16], _| push(&mut d.iter().map(|s| (*s as f32 - 32768.0) / 32768.0)),
-                    err,
-                    None,
-                ),
-                other => return Err(format!("Unsupported microphone format {other:?}")),
-            }
-            .map_err(|e| e.to_string())?;
-            stream.play().map_err(|e| e.to_string())?;
-            while !s2.load(Ordering::SeqCst) {
-                std::thread::sleep(Duration::from_millis(40));
-            }
-            drop(stream);
-            if let Some(w) = writer.lock().take() {
-                w.finalize().map_err(|e| e.to_string())?;
-            }
-            let offset = first.lock().map(|f| f.saturating_duration_since(t0).as_secs_f64()).unwrap_or(0.0);
-            if first.lock().is_none() {
-                return Ok(None); // permission denied or silent device: no audio track
-            }
-            Ok(Some((wav, offset)))
-        })
-        .ok();
-    AudioCapture { stop, thread }
-}
-
 // ---------------------------------------------------------------------------
 // A recording
 
@@ -340,10 +236,11 @@ pub struct Recording {
     pub started: Instant,
     pub path: PathBuf,
     pub status: Arc<Mutex<RecStatus>>,
-    pub mic_level: Arc<AtomicU32>,
+    pub microphone: Option<Arc<InputTrack>>,
+    pub screen_audio: Option<Arc<InputTrack>>,
     pub dropped: Arc<AtomicU64>,
     pub paused: Arc<AtomicBool>,
-    paused_total: Arc<Mutex<(Duration, Option<Instant>)>>,
+    paused_total: PauseTime,
     tx: Sender<FrameRef>,
     stop: Arc<AtomicBool>,
 }
@@ -354,6 +251,8 @@ pub struct RecordRequest {
     pub folder: PathBuf,
     pub mic: Option<String>,
     pub record_audio: bool,
+    pub mic_volume: u8,
+    pub screen_audio: Option<ScreenAudioRequest>,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -365,17 +264,14 @@ impl Recording {
         self.tx.clone()
     }
 
-    pub fn mic_level(&self) -> f32 {
-        f32::from_bits(self.mic_level.load(Ordering::Relaxed))
-    }
-
     pub fn start(req: RecordRequest) -> Result<Recording, String> {
         std::fs::create_dir_all(&req.folder).map_err(|e| format!("Can't use the recordings folder: {e}"))?;
-        let stamp = chrono::Local::now().format("%Y-%m-%d at %H.%M.%S").to_string();
+        let stamp = chrono::Local::now().format("%Y-%m-%d at %H.%M.%S%.3f").to_string();
         let base = format!("Lecture {stamp}");
         let final_path = req.folder.join(format!("{base}.mp4"));
         let video_tmp = req.folder.join(format!(".{base}.video.mkv"));
-        let audio_tmp = req.folder.join(format!(".{base}.audio.wav"));
+        let mic_tmp = req.folder.join(format!(".{base}.audio.wav"));
+        let screen_tmp = req.folder.join(format!(".{base}.screen.wav"));
         let log_path = data_dir().join("last-recording.log");
         let _ = std::fs::create_dir_all(data_dir());
 
@@ -400,17 +296,20 @@ impl Recording {
         let (tx, rx): (Sender<FrameRef>, Receiver<FrameRef>) = bounded(3);
         let status = Arc::new(Mutex::new(RecStatus::Recording));
         let stop = Arc::new(AtomicBool::new(false));
-        let mic_level = Arc::new(AtomicU32::new(0));
         let dropped = Arc::new(AtomicU64::new(0));
         let t0 = Instant::now();
         let paused = Arc::new(AtomicBool::new(false));
-        let paused_total: Arc<Mutex<(Duration, Option<Instant>)>> = Arc::new(Mutex::new((Duration::ZERO, None)));
+        let paused_total: PauseTime = Arc::new(Mutex::new((Duration::ZERO, None)));
 
-        let audio = if req.record_audio {
-            Some(start_audio(req.mic.clone(), audio_tmp.clone(), t0, mic_level.clone(), paused.clone(), req.muted.clone()))
-        } else {
-            None
-        };
+        let microphone = req.record_audio.then(|| InputTrack::new(req.mic_volume, req.muted));
+        let screen_audio = req.screen_audio.as_ref().map(|input| InputTrack::new(input.volume, Arc::new(AtomicBool::new(input.muted))));
+        let mut audio = Vec::with_capacity(2);
+        if let Some(track) = &microphone {
+            audio.push(recording_audio::microphone(req.mic, mic_tmp, t0, paused.clone(), paused_total.clone(), track.clone()));
+        }
+        if let Some((input, track)) = req.screen_audio.zip(screen_audio.as_ref()) {
+            audio.push(recording_audio::screen(input.feed, screen_tmp, t0, paused.clone(), paused_total.clone(), track.clone()));
+        }
         let (pz, pt) = (paused.clone(), paused_total.clone());
 
         let (st, sp, dr) = (status.clone(), stop.clone(), dropped.clone());
@@ -437,20 +336,8 @@ impl Recording {
                     }
                     // Keep exactly `fps` frames per second of (unpaused) wall
                     // time, so the picture never drifts away from the voice.
-                    {
-                        let mut p = pt.lock();
-                        let now_paused = pz.load(Ordering::Relaxed);
-                        match (now_paused, p.1) {
-                            (true, None) => p.1 = Some(Instant::now()),
-                            (false, Some(since)) => {
-                                p.0 += since.elapsed();
-                                p.1 = None;
-                            }
-                            _ => {}
-                        }
-                        if now_paused {
-                            continue;
-                        }
+                    if pz.load(Ordering::Relaxed) {
+                        continue;
                     }
                     let active = t0.elapsed().saturating_sub(pt.lock().0);
                     let due = (active.as_secs_f64() * fps as f64).floor() as u64 + 1;
@@ -471,12 +358,12 @@ impl Recording {
                     }
                 }
                 *st.lock() = RecStatus::Finishing;
+                for capture in &audio {
+                    capture.stop();
+                }
                 drop(stdin);
                 let enc_ok = child.wait().is_ok_and(|s| s.success());
-                let audio_res = audio.map(|mut a| {
-                    a.stop.store(true, Ordering::SeqCst);
-                    a.thread.take().and_then(|t| t.join().ok()).unwrap_or(Ok(None))
-                });
+                let audio_parts: Vec<_> = audio.into_iter().filter_map(AudioCapture::finish).collect();
                 if let Some(msg) = failed {
                     if !video_tmp.exists() {
                         *st.lock() = RecStatus::Failed(msg);
@@ -487,15 +374,11 @@ impl Recording {
                     *st.lock() = RecStatus::Failed("The recording engine couldn't write the video. See last-recording.log.".into());
                     return;
                 }
-                let audio_part = match audio_res {
-                    Some(Ok(Some(a))) => Some(a),
-                    _ => None,
-                };
-                match finalize(&ffmpeg, &video_tmp, audio_part.as_ref(), &final2) {
+                match finalize(&ffmpeg, &video_tmp, &audio_parts, &final2) {
                     Ok(()) => {
                         let _ = std::fs::remove_file(&video_tmp);
-                        if let Some((a, _)) = &audio_part {
-                            let _ = std::fs::remove_file(a);
+                        for audio in &audio_parts {
+                            let _ = std::fs::remove_file(&audio.path);
                         }
                         *st.lock() = RecStatus::Saved(final2);
                     }
@@ -514,7 +397,8 @@ impl Recording {
             started: t0,
             path: final_path,
             status,
-            mic_level,
+            microphone,
+            screen_audio,
             dropped,
             paused,
             paused_total,
@@ -524,11 +408,19 @@ impl Recording {
     }
 
     pub fn stop(&self) {
-        self.paused.store(false, Ordering::SeqCst);
         self.stop.store(true, Ordering::SeqCst);
     }
 
     pub fn set_paused(&self, on: bool) {
+        let mut pause = self.paused_total.lock();
+        match (on, pause.1) {
+            (true, None) => pause.1 = Some(Instant::now()),
+            (false, Some(since)) => {
+                pause.0 += since.elapsed();
+                pause.1 = None;
+            }
+            _ => {}
+        }
         self.paused.store(on, Ordering::SeqCst);
     }
 
@@ -548,22 +440,42 @@ impl Recording {
     }
 }
 
-fn finalize(ffmpeg: &Path, video: &Path, audio: Option<&(PathBuf, f64)>, out: &Path) -> Result<(), String> {
+fn finalize(ffmpeg: &Path, video: &Path, audio: &[TrackFile], out: &Path) -> Result<(), String> {
     let partial = out.with_extension("partial.mp4");
     let mut cmd = Command::new(ffmpeg);
     cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-i"]).arg(video);
-    if let Some((wav, offset)) = audio {
-        cmd.args(["-itsoffset", &format!("{offset:.3}")]);
-        let channels = hound::WavReader::open(wav).map_err(|e| e.to_string())?.spec().channels;
+    for track in audio {
+        let channels = hound::WavReader::open(&track.path).map_err(|e| e.to_string())?.spec().channels;
         if channels == 1 {
             // Hound's extensible mono WAV names the channel FL, which
             // FFmpeg's AAC encoder rejects as a single-channel layout.
             cmd.args(["-channel_layout", "mono"]);
         }
-        cmd.arg("-i").arg(wav);
-        cmd.args(["-map", "0:v:0", "-map", "1:a:0", "-af", "apad", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-shortest"]);
-    } else {
-        cmd.args(["-c", "copy"]);
+        cmd.arg("-i").arg(&track.path);
+    }
+
+    let delay = |track: &TrackFile| format!("adelay={}:all=1", track.offset.as_millis());
+    match audio {
+        [] => {
+            cmd.args(["-c", "copy"]);
+        }
+        [track] => {
+            cmd.args(["-map", "0:v:0", "-map", "1:a:0", "-af"]).arg(format!("{},apad", delay(track)));
+        }
+        [mic, screen] => {
+            let filter = format!(
+                "[1:a]aformat=sample_rates=48000:channel_layouts=stereo,{}[mic];\
+                 [2:a]aformat=sample_rates=48000:channel_layouts=stereo,{}[screen];\
+                 [mic][screen]amix=inputs=2:duration=longest:normalize=0,alimiter=limit=0.95:level=0:latency=1,apad[mixed]",
+                delay(mic),
+                delay(screen),
+            );
+            cmd.args(["-filter_complex", &filter, "-map", "0:v:0", "-map", "[mixed]"]);
+        }
+        _ => return Err("Too many recording audio inputs.".into()),
+    }
+    if !audio.is_empty() {
+        cmd.args(["-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-shortest"]);
     }
     cmd.args(["-movflags", "+faststart"]).arg(&partial);
     let o = hidden(&mut cmd).output().map_err(|e| e.to_string())?;
@@ -579,32 +491,44 @@ fn finalize(ffmpeg: &Path, video: &Path, audio: Option<&(PathBuf, f64)>, out: &P
 mod tests {
     use super::*;
 
-    #[test]
-    #[ignore = "requires FFmpeg"]
-    fn exports_hound_mono_without_cutting_the_picture_short() {
-        let ffmpeg = find_ffmpeg().expect("FFmpeg is required for this test");
-        let dir = std::env::temp_dir().join(format!("studio-record-export-test-{}", std::process::id()));
+    fn video_fixture(ffmpeg: &Path, dir: &Path) -> PathBuf {
         std::fs::create_dir(&dir).unwrap();
         let video = dir.join("video.mkv");
-        let wav = dir.join("voice.wav");
-        let out = dir.join("recording.mp4");
-        let input = Command::new(&ffmpeg)
+        let input = Command::new(ffmpeg)
             .args(["-v", "error", "-f", "lavfi", "-i", "color=s=64x64:r=20:d=2", "-c:v", "mpeg4"])
             .arg(&video)
             .output()
             .unwrap();
         assert!(input.status.success(), "{}", String::from_utf8_lossy(&input.stderr));
-        let mut writer = hound::WavWriter::create(&wav, hound::WavSpec {
-            channels: 1,
-            sample_rate: 24000,
+        video
+    }
+
+    fn voice_fixture(path: &Path, frames: u32, channels: u16, rate: u32, amplitude: f32) {
+        let mut writer = hound::WavWriter::create(path, hound::WavSpec {
+            channels,
+            sample_rate: rate,
             bits_per_sample: 32,
             sample_format: hound::SampleFormat::Float,
         }).unwrap();
-        for i in 0..12_000 {
-            writer.write_sample((i as f32 * 0.1).sin() * 0.25).unwrap();
+        for i in 0..frames {
+            if channels == 2 {
+                writer.write_sample(0.0f32).unwrap();
+            }
+            writer.write_sample((i as f32 * 0.1).sin() * amplitude).unwrap();
         }
         writer.finalize().unwrap();
-        finalize(&ffmpeg, &video, Some(&(wav, 0.1)), &out).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires FFmpeg"]
+    fn exports_hound_mono_without_cutting_the_picture_short() {
+        let ffmpeg = find_ffmpeg().expect("FFmpeg is required for this test");
+        let dir = std::env::temp_dir().join(format!("studio-record-export-test-{}", std::process::id()));
+        let video = video_fixture(&ffmpeg, &dir);
+        let wav = dir.join("voice.wav");
+        let out = dir.join("recording.mp4");
+        voice_fixture(&wav, 12_000, 1, 24_000, 0.25);
+        finalize(&ffmpeg, &video, &[TrackFile { path: wav, offset: Duration::from_millis(100) }], &out).unwrap();
         let decoded = Command::new(&ffmpeg)
             .args(["-v", "error", "-i"]).arg(&out)
             .args(["-map", "0:a:0", "-f", "s16le", "-"])
@@ -612,6 +536,41 @@ mod tests {
         assert!(decoded.status.success());
         assert!(decoded.stdout.len() >= 24_000 * 2 * 18 / 10, "audio padding should cover the full video");
         assert!(decoded.stdout.chunks_exact(2).any(|s| i16::from_le_bytes([s[0], s[1]]).unsigned_abs() > 1000));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires FFmpeg"]
+    fn mixed_export_preserves_track_timing_and_stereo() {
+        let ffmpeg = find_ffmpeg().expect("FFmpeg is required for this test");
+        let dir = std::env::temp_dir().join(format!("studio-record-mix-test-{}", std::process::id()));
+        let video = video_fixture(&ffmpeg, &dir);
+        let mic = dir.join("mic.wav");
+        let screen = dir.join("screen.wav");
+        let out = dir.join("mixed.mp4");
+        voice_fixture(&mic, 24_000, 1, 24_000, 0.2);
+        voice_fixture(&screen, 48_000, 2, 48_000, 0.4);
+        finalize(&ffmpeg, &video, &[
+            TrackFile { path: mic, offset: Duration::ZERO },
+            TrackFile { path: screen, offset: Duration::from_millis(500) },
+        ], &out).unwrap();
+
+        let pcm = Command::new(&ffmpeg)
+            .args(["-v", "error", "-i"]).arg(&out)
+            .args(["-map", "0:a:0", "-f", "f32le", "-"])
+            .output().unwrap();
+        assert!(pcm.status.success());
+        let samples: Vec<_> = pcm.stdout.chunks_exact(4)
+            .map(|sample| f32::from_le_bytes(sample.try_into().unwrap()))
+            .collect();
+        let peak = |seconds: f32, channel: usize| {
+            let start = (48_000.0 * seconds) as usize * 2 + channel;
+            samples[start..start + 4_800].iter().step_by(2).map(|s| s.abs()).fold(0.0, f32::max)
+        };
+        assert!(peak(0.2, 0) > 0.05 && peak(0.2, 1) > 0.05, "mono mic should appear in both channels");
+        assert!(peak(0.7, 1) > 2.0 * peak(0.7, 0), "both tracks should be audible during overlap");
+        assert!(peak(1.2, 1) > 0.2 && peak(1.2, 0) < 0.05, "delayed screen track should keep its stereo placement");
+        assert!(peak(1.7, 1) < 0.05, "audio padding should be silent");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

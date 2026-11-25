@@ -57,11 +57,19 @@ pub enum SourceState {
 }
 
 /// What the mixer would like from a source, so we can scale at the source.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 pub struct CaptureOptions {
     pub max_width: u32,
     pub max_height: u32,
     pub fps: u32,
+    pub screen_audio: Option<crate::recording_audio::ScreenAudioFeed>,
+}
+
+pub fn screen_audio_supported() -> bool {
+    #[cfg(target_os = "macos")]
+    { mac::screen_audio_supported() }
+    #[cfg(not(target_os = "macos"))]
+    { false }
 }
 
 pub struct CaptureHandle {

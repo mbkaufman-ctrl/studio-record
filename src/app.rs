@@ -7,6 +7,7 @@ use crate::capture::{self, CaptureHandle, CaptureOptions, DeviceInfo, DeviceKind
 use crate::icons::{self, Icon};
 use crate::mixer::{self, Corner, Layout, MixSettings, Mixer, OutputSize, PipShape, PipSize, Role, Scene, Transition};
 use crate::recorder::{self, RecStatus, RecordRequest, Recording};
+use crate::recording_audio::{InputState, InputTrack, ScreenAudioFeed, ScreenAudioRequest};
 use crate::theme::{self, ThemeChoice, Tokens, R, R_SM, S12, S16, S20, S24, S4, S8};
 use crate::vcam::{self, VcamStatus, VirtualCamera};
 use crate::widgets::{self, font, font_medium, font_semibold, mono, HoverTr, Variant};
@@ -49,6 +50,10 @@ pub struct Settings {
     pub scene_set: u32,
     pub camera_on: bool,
     pub mic_muted: bool,
+    pub mic_volume: u8,
+    pub record_screen_audio: bool,
+    pub screen_audio_volume: u8,
+    pub screen_audio_muted: bool,
     pub panel_on_launch: bool,
     pub bridge_output: Option<String>,
     pub bridge_on: bool,
@@ -80,6 +85,10 @@ impl Default for Settings {
             scene_set: mixer::SCENE_SET,
             camera_on: true,
             mic_muted: false,
+            mic_volume: 100,
+            record_screen_audio: false,
+            screen_audio_volume: 100,
+            screen_audio_muted: false,
             panel_on_launch: true,
             bridge_output: None,
             bridge_on: false,
@@ -206,6 +215,7 @@ pub struct StudioApp {
     link: Option<LinkPage>,
     link_input: String,
     mic_muted: Arc<AtomicBool>,
+    screen_audio_feed: ScreenAudioFeed,
     bridge: Option<AudioBridge>,
     outputs: Vec<String>,
     setup_open: bool,
@@ -231,6 +241,9 @@ impl StudioApp {
             Settings { theme: if light { ThemeChoice::Light } else { ThemeChoice::Dark }, ..Default::default() }
         };
         let mut s = s;
+        if !live && std::env::var_os("STUDIO_RECORD_TEST_AUDIO").is_some() {
+            s.record_screen_audio = true;
+        }
         if s.scenes.is_empty() || s.scene_set < mixer::SCENE_SET {
             s.scenes = mixer::default_scenes();
             s.scene_set = mixer::SCENE_SET;
@@ -308,6 +321,7 @@ impl StudioApp {
             link: None,
             link_input,
             mic_muted,
+            screen_audio_feed: ScreenAudioFeed::default(),
             bridge: None,
             outputs,
             setup_open: false,
@@ -361,7 +375,7 @@ impl StudioApp {
 
     fn capture_opts(&self) -> CaptureOptions {
         let (w, h) = self.s.mix.size.dims();
-        CaptureOptions { max_width: w, max_height: h, fps: self.s.mix.fps }
+        CaptureOptions { max_width: w, max_height: h, fps: self.s.mix.fps, screen_audio: None }
     }
 
     // -- devices -----------------------------------------------------------
@@ -451,7 +465,11 @@ impl StudioApp {
                 }
             }
             if !self.sources.contains_key(&role) {
-                let h = capture::open(&dev, opts);
+                let mut source_opts = opts.clone();
+                if role == Role::Screen && self.s.record_screen_audio && capture::screen_audio_supported() {
+                    source_opts.screen_audio = Some(self.screen_audio_feed.clone());
+                }
+                let h = capture::open(&dev, source_opts);
                 self.mixer.set_source(role, Some(h.slot.clone()));
                 self.sources.insert(role, h);
             }
@@ -554,6 +572,9 @@ impl StudioApp {
     fn toggle_mute(&mut self) {
         self.s.mic_muted = !self.s.mic_muted;
         self.mic_muted.store(self.s.mic_muted, Ordering::SeqCst);
+        if let Some(track) = self.recording.as_ref().and_then(|rec| rec.microphone.as_ref()) {
+            track.set_muted(self.s.mic_muted);
+        }
     }
 
     fn toggle_camera(&mut self) {
@@ -596,6 +617,9 @@ impl StudioApp {
             self.finishing.push(rec);
             return;
         }
+        if !self.finishing.is_empty() {
+            return;
+        }
         let engine = self.engine.lock().clone();
         let Engine::Ready { path, encoder } = engine else {
             self.toast("Recording needs the free FFmpeg engine — set it up in Output.".into(), None, true);
@@ -608,6 +632,12 @@ impl StudioApp {
             folder: self.s.folder(),
             mic: self.s.mic.clone(),
             record_audio: self.s.record_audio,
+            mic_volume: self.s.mic_volume,
+            screen_audio: (self.s.record_screen_audio && capture::screen_audio_supported()).then(|| ScreenAudioRequest {
+                feed: self.screen_audio_feed.clone(),
+                volume: self.s.screen_audio_volume,
+                muted: self.s.screen_audio_muted,
+            }),
             width: w,
             height: h,
             fps: self.s.mix.fps,
@@ -716,7 +746,21 @@ impl StudioApp {
             match r.status() {
                 RecStatus::Saved(p) => {
                     let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    done.push((i, trf("Saved \"{}\"", &[&name]), Some(p), false));
+                    let audio_issue = [
+                        ("Microphone", r.microphone.as_deref()),
+                        ("Screen audio", r.screen_audio.as_deref()),
+                    ]
+                    .into_iter()
+                    .filter_map(|(name, input)| {
+                        input.filter(|input| matches!(input.state(), InputState::Error(_))).map(|_| tr(name))
+                    })
+                    .collect::<Vec<_>>().join(" · ");
+                    let text = if audio_issue.is_empty() {
+                        trf("Saved \"{}\"", &[&name])
+                    } else {
+                        trf("Saved \"{}\". Check audio from {}.", &[&name, &audio_issue])
+                    };
+                    done.push((i, text, Some(p), !audio_issue.is_empty()));
                 }
                 RecStatus::Failed(e) => done.push((i, e, None, true)),
                 _ => {}
@@ -1328,6 +1372,9 @@ impl StudioApp {
             self.source_card(ui, t, Role::Link);
         }
         ui.add_space(S16);
+        if !self.live && std::env::var_os("STUDIO_RECORD_TEST_AUDIO").is_some() {
+            ui.scroll_to_cursor(Some(Align::Min));
+        }
         widgets::caption(ui, t, "Output");
         self.output_card(ui, t);
         ui.add_space(S16);
@@ -1834,6 +1881,140 @@ impl StudioApp {
         });
     }
 
+    fn recording_audio_ui(&mut self, ui: &mut Ui, t: &Tokens) {
+        let active = self.recording.is_some();
+        let full = ui.available_width();
+        widgets::caption(ui, t, "Recording audio");
+        widgets::row(ui, |ui| {
+            widgets::label(ui, widgets::Txt::new("Microphone").font(font_medium(13.0)).color(t.text_primary));
+            ui.with_layout(widgets::end(Align::Center), |ui| {
+                ui.add_enabled_ui(!active, |ui| {
+                    widgets::switch(ui, t, &mut self.s.record_audio)
+                        .accessible_name(tr("Record your voice with the video"))
+                        .on_hover_tr("Record your voice with the video");
+                });
+            });
+        });
+        if self.s.record_audio {
+            let sel = self.s.mic.clone().unwrap_or_else(|| "System default".into());
+            let mut choice = self.s.mic.clone();
+            ui.add_enabled_ui(!active, |ui| {
+                egui::ComboBox::from_id_salt("mic")
+                    .selected_text(widgets::Txt::new(sel).font(font(13.0)))
+                    .width(ui.available_width())
+                    .truncate()
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut choice, None, widgets::Txt::new("System default"));
+                        for m in &self.mics {
+                            ui.selectable_value(&mut choice, Some(m.clone()), m);
+                        }
+                    })
+                    .response
+                    .accessible_name(tr("Microphone"));
+            });
+            if choice != self.s.mic {
+                self.s.mic = choice;
+                if self.bridge.is_some() {
+                    self.toggle_bridge();
+                    self.toggle_bridge();
+                }
+            }
+            let rec = self.recording.as_ref();
+            Self::audio_fader(
+                ui, t, "Microphone volume", &mut self.s.mic_volume,
+                rec.and_then(|r| r.microphone.as_deref()), rec.is_some_and(Recording::is_paused),
+            );
+            if self.live && self.perm(PermKind::Microphone) != PermStatus::Granted
+                && widgets::button(ui, t, Variant::Outline, None, "Allow microphone in Setup check", None, Some(full), 32.0).clicked()
+            {
+                self.setup_open = true;
+            }
+        }
+        let muted = self.s.mic_muted;
+        if widgets::button(
+            ui, t, if muted { Variant::AccentOutline } else { Variant::Ghost },
+            Some(if muted { Icon::MicOff } else { Icon::Mic }),
+            if muted { "Unmute microphone" } else { "Mute microphone" },
+            Some(if cfg!(target_os = "macos") { "⌃⌥M" } else { "Ctrl Alt M" }),
+            Some(full), 32.0,
+        ).clicked() {
+            self.toggle_mute();
+        }
+
+        let supported = capture::screen_audio_supported();
+        ui.separator();
+        widgets::row(ui, |ui| {
+            widgets::label(ui, widgets::Txt::new("Screen audio").font(font_medium(13.0)).color(t.text_primary));
+            ui.with_layout(widgets::end(Align::Center), |ui| {
+                ui.add_enabled_ui(supported && !active, |ui| {
+                    if widgets::switch(ui, t, &mut self.s.record_screen_audio)
+                        .accessible_name(tr("Record screen audio"))
+                        .on_hover_tr("Record screen audio")
+                        .changed()
+                    {
+                        self.sources.remove(&Role::Screen);
+                        self.mixer.set_source(Role::Screen, None);
+                    }
+                });
+            });
+        });
+        if !supported {
+            widgets::label(ui, widgets::Txt::new("Screen audio requires macOS 13 or later.").font(font(12.0)).color(t.text_tertiary));
+            return;
+        }
+        if self.s.record_screen_audio {
+            if self.s.screen.as_deref().and_then(|id| self.device(id)).is_none() {
+                widgets::label(ui, widgets::Txt::new("Choose a screen or window in Sources.").font(font(12.0)).color(t.text_tertiary));
+            } else if self.live && self.perm(PermKind::Screen) != PermStatus::Granted
+                && widgets::button(ui, t, Variant::Outline, None, "Allow screen recording in Setup check", None, Some(full), 32.0).clicked()
+            {
+                self.setup_open = true;
+            }
+            let rec = self.recording.as_ref();
+            Self::audio_fader(
+                ui, t, "Screen audio volume", &mut self.s.screen_audio_volume,
+                rec.and_then(|r| r.screen_audio.as_deref()), rec.is_some_and(Recording::is_paused),
+            );
+            let muted = self.s.screen_audio_muted;
+            if widgets::button(
+                ui, t, if muted { Variant::AccentOutline } else { Variant::Ghost }, None,
+                if muted { "Unmute screen audio" } else { "Mute screen audio" }, None, Some(full), 32.0,
+            ).clicked() {
+                self.s.screen_audio_muted = !muted;
+                if let Some(track) = self.recording.as_ref().and_then(|rec| rec.screen_audio.as_ref()) {
+                    track.set_muted(!muted);
+                }
+            }
+        } else {
+            widgets::label(ui, widgets::Txt::new("Include sound from the selected screen or window’s app.").font(font(12.0)).color(t.text_tertiary));
+        }
+    }
+
+    fn audio_fader(ui: &mut Ui, t: &Tokens, name: &str, volume: &mut u8, track: Option<&InputTrack>, paused: bool) {
+        ui.scope(|ui| {
+            widgets::col(ui, |ui| widgets::label(ui, widgets::Txt::new(name).font(font(12.0)).color(t.text_secondary)));
+            ui.spacing_mut().slider_width = (ui.available_width() - 64.0).max(48.0);
+            let changed = ui.add(egui::Slider::new(volume, 0..=100).suffix("%").trailing_fill(true))
+                .accessible_name(tr(name))
+                .changed();
+            if let Some(track) = track {
+                if changed {
+                    track.set_volume(*volume);
+                }
+                widgets::meter(ui, t, if paused { 0.0 } else { track.level() }, ui.available_width());
+                match track.state() {
+                    InputState::Waiting if !paused => {
+                        widgets::label(ui, widgets::Txt::new("Waiting for audio…").font(font(12.0)).color(t.text_tertiary));
+                    }
+                    InputState::Error(message) => {
+                        widgets::label(ui, widgets::Txt::new("Audio unavailable").font(font(12.0)).color(t.danger)).on_hover_tr(message);
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+
     fn output_card(&mut self, ui: &mut Ui, t: &Tokens) {
         let ctx = ui.ctx().clone();
         widgets::card(ui, t, |ui| {
@@ -1841,18 +2022,10 @@ impl StudioApp {
             let engine = self.engine.lock().clone();
             let full = ui.available_width();
             if let Some(rec) = &self.recording {
-                let el = rec.started.elapsed().as_secs();
+                let el = rec.elapsed().as_secs();
                 let label = trf("Stop recording   {}", &[&format!("{:02}:{:02}:{:02}", el / 3600, (el / 60) % 60, el % 60)]);
-                let level = rec.mic_level();
                 if widgets::button(ui, t, Variant::AccentOutline, Some(Icon::Stop), &label, None, Some(full), 40.0).clicked() {
                     self.toggle_record();
-                }
-                if self.s.record_audio {
-                    widgets::row(ui, |ui| {
-                        icons::paint(ui.painter(), Rect::from_center_size(ui.cursor().min + vec2(8.0, 8.0), vec2(14.0, 14.0)), Icon::Mic, t.text_tertiary);
-                        ui.add_space(22.0);
-                        widgets::meter(ui, t, level, ui.available_width());
-                    });
                 }
             } else if !self.finishing.is_empty() {
                 widgets::button(ui, t, Variant::Outline, None, "Saving recording…", None, Some(full), 40.0);
@@ -1904,38 +2077,7 @@ impl StudioApp {
             }
 
             ui.add_space(S4);
-            // Microphone.
-            widgets::row(ui, |ui| {
-                widgets::label(ui, widgets::Txt::new("Microphone").font(font(13.0)).color(t.text_secondary));
-                ui.with_layout(widgets::end(Align::Center), |ui| {
-                    widgets::switch(ui, t, &mut self.s.record_audio).on_hover_tr("Record your voice with the video");
-                });
-            });
-            if self.s.record_audio {
-                let sel = self.s.mic.clone().unwrap_or_else(|| "System default".into());
-                let mut choice = self.s.mic.clone();
-                ui.add_enabled_ui(self.recording.is_none(), |ui| {
-                    egui::ComboBox::from_id_salt("mic").selected_text(widgets::Txt::new(sel).font(font(13.0))).width(ui.available_width()).show_ui(ui, |ui| {
-                        ui.selectable_value(&mut choice, None, widgets::Txt::new("System default"));
-                        for m in &self.mics {
-                            ui.selectable_value(&mut choice, Some(m.clone()), m);
-                        }
-                    });
-                });
-                if choice != self.s.mic {
-                    self.s.mic = choice;
-                    if self.bridge.is_some() {
-                        self.toggle_bridge();
-                        self.toggle_bridge();
-                    }
-                }
-            }
-            let mute_label = if self.s.mic_muted { "Unmute microphone" } else { "Mute microphone" };
-            let v = if self.s.mic_muted { Variant::AccentOutline } else { Variant::Ghost };
-            if widgets::button(ui, t, v, Some(if self.s.mic_muted { Icon::MicOff } else { Icon::Mic }), mute_label, Some(if cfg!(target_os = "macos") { "⌃⌥M" } else { "Ctrl Alt M" }), Some(full), 32.0).clicked() {
-                self.toggle_mute();
-            }
-
+            self.recording_audio_ui(ui, t);
             ui.add_space(S4);
             ui.separator();
             ui.add_space(S4);
