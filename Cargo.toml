@@ -1,6 +1,6 @@
 [package]
 name = "studio-record"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.95"
 description = "Open-source lecture studio: camera + screen + iPad scenes, recording and a virtual camera for video calls."
